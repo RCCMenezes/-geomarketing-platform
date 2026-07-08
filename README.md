@@ -1,2 +1,2 @@
-# -geomarketing-platform
+# geomarketing-platform
 avaliaçao
