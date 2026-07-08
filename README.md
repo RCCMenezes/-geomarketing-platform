@@ -1,0 +1,2 @@
+# -geomarketing-platform
+avaliaçao
