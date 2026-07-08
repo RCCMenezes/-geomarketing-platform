@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
+
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 
@@ -183,7 +184,7 @@ def load_data() -> pd.DataFrame:
 
 
 DF = load_data()
-CHAINS = sorted(DF["cadeia"].unique().tolist()) if not DF.empty and "cadeia" in DF.columns else []
+CHAINS = sorted(DF["cadeia"].unique().tolist())
 
 # A aplicação considera apenas interseções com a Volta.
 # Não calcular/mostrar Amanhecer x Meu Super.
@@ -376,7 +377,7 @@ def competition_map(df: pd.DataFrame, title: str):
     fig.update_layout(mapbox_style="open-street-map", margin=dict(l=0, r=0, t=30, b=0), title=title, legend_title="Cadeia")
     return fig
 
-DF_COMP = nearest_competition(DF) if not DF.empty else DF.copy()
+DF_COMP = nearest_competition(DF)
 
 
 def kpi_card(label, value):
@@ -515,7 +516,12 @@ def sidebar():
         dcc.Link("🔢 Matriz", href="/matriz", className="side-link"),
         dcc.Link("⬢ Hexbin / Densidade", href="/densidade", className="side-link"),
         dcc.Link("🎯 Concorrência", href="/concorrencia", className="side-link"),
-        # Downloads desativados na versão Hugging Face Spaces
+        html.Div("Downloads", className="side-section"),
+        html.Button("CSV", id="download-csv-btn", className="btn btn-sm btn-light me-2"),
+        html.Button("Excel", id="download-xlsx-btn", className="btn btn-sm btn-outline-light"),
+        dcc.Download(id="download-csv"), dcc.Download(id="download-xlsx"),
+        dbc.Button("⬇ Download Interseções CSV", id="download-intersections-btn", color="success", className="w-100 mt-2"),
+        dcc.Download(id="download-intersections"),
     ], className="sidebar")
 
 
@@ -647,8 +653,7 @@ def page_statistics():
     ])
 
 
-app = Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP],
-          suppress_callback_exceptions=True)
+app = Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP], suppress_callback_exceptions=True)
 server = app.server
 app.layout = html.Div([dcc.Location(id="url"), sidebar(), html.Main(id="page", className="main")])
 
@@ -776,10 +781,53 @@ def update_competition(base_chain, competitor_chain, radius):
         return dbc.Alert(f"Erro no cálculo de concorrência: {e}", color="danger"), empty_fig("Erro"), html.Div(str(e), className="small-note")
 
 
-# Callback dl_csv desativado
+@app.callback(Output("download-csv", "data"), Input("download-csv-btn", "n_clicks"), prevent_initial_call=True)
+def dl_csv(n):
+    # Gerar dados de concorrência (inclui as colunas dist_concorrente_m, concorrentes_no_raio, etc.)
+    df_combined = competition_dataset("Todas", "Todas", DEFAULT_RADIUS)
+
+    # Garantir tipo correcto na coluna de distância
+    if "dist_concorrente_m" in df_combined.columns:
+        df_combined["dist_concorrente_m"] = pd.to_numeric(df_combined["dist_concorrente_m"], errors="coerce")
+
+    # Garantir tipo correcto na coluna de contagem de concorrentes
+    if "concorrentes_no_raio" in df_combined.columns:
+        df_combined["concorrentes_no_raio"] = pd.to_numeric(df_combined["concorrentes_no_raio"], errors="coerce")
+
+    # Agregar por cadeia — as colunas já existem neste ponto
+    chain_aggregation = df_combined.groupby("cadeia").agg(
+        total_lojas=("nome", "count"),
+        media_distancia=("dist_concorrente_m", "mean"),
+        max_concorrentes=("concorrentes_no_raio", "max"),
+        lojas_com_concorrente=("dist_concorrente_m", lambda x: x.notna().sum())
+    ).reset_index()
+
+    # Renomear colunas para maior clareza
+    chain_aggregation.columns = [
+        "Cadeia",
+        "Total de Lojas",
+        "Distância Média (m)",
+        "Máx. Concorrentes",
+        "Lojas com Concorrência"
+    ]
+
+    # Substituir valores vazios nas colunas de texto de concorrência
+    for col in ["concorrente_mais_proximo", "loja_concorrente"]:
+        if col in df_combined.columns:
+            df_combined[col] = df_combined[col].replace("", "Nenhum")
+
+    # Exportar apenas o DataFrame principal (com colunas de concorrência já incluídas)
+    return dcc.send_data_frame(df_combined.to_csv, "geomarketing_dados_completo.csv", index=False, encoding="utf-8-sig")
 
 
-# Callback dl_xlsx desativado
+@app.callback(Output("download-xlsx", "data"), Input("download-xlsx-btn", "n_clicks"), prevent_initial_call=True)
+def dl_xlsx(n):
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        DF.to_excel(writer, index=False, sheet_name="lojas")
+        DF_COMP.to_excel(writer, index=False, sheet_name="concorrencia")
+    buf.seek(0)
+    return dcc.send_bytes(buf.getvalue(), "geomarketing_dados.xlsx")
 
 
 # Callbacks de Estatísticas
@@ -937,9 +985,34 @@ def update_statistics(chain_filter):
 
 
 
-# Callback download_intersections desativado
+@app.callback(
+    Output("download-intersections","data"),
+    Input("download-intersections-btn","n_clicks"),
+    State("inter-pair","value"),
+    State("inter-radius","value"),
+    prevent_initial_call=True,
+)
+def download_intersections(n_clicks, pair_key, radius):
+    if n_clicks is None or n_clicks <= 0:
+        return None
+    try:
+        pair_key = pair_key or "Todas"
+        radius = int(radius or DEFAULT_RADIUS)
+        df = all_intersections(radius, pair_key or "Todas")
+        cols = ["cadeia_a", "loja_a", "morada_a", "lat_a", "lon_a",
+                "cadeia_b", "loja_b", "morada_b", "lat_b", "lon_b", "dist_m"]
+        df = df[cols]
+        if df.empty:
+            return None
+        filename = f"intersecoes_{pair_key.replace(' x ', '_')}_{radius}m.csv"
+        return dcc.send_data_frame(df.to_csv, filename, index=False, encoding="utf-8-sig")
+    except Exception:
+        return None
 
 
-# ── Arranque para Hugging Face Spaces ──
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=7860, debug=False, use_reloader=False)
+    app.run(
+        debug=True,
+        host="127.0.0.1",
+        port=8055
+    )
