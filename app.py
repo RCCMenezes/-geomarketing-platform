@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import io
 import itertools
+import json
 import math
 import re
+import unicodedata
+import urllib.request
 from pathlib import Path
 
 import dash
@@ -13,8 +16,10 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
+
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
+GEOBOUNDARIES_API = "https://www.geoboundaries.org/api/current/gbOpen/PRT/{adm}/"
 
 CHAIN_COLORS = {
     "Amanhecer": "#e63946",
@@ -28,6 +33,11 @@ def clean_text(x: object) -> str:
     if x is None or (isinstance(x, float) and pd.isna(x)):
         return ""
     s = str(x)
+    if "Ã" in s or "Â" in s:
+        try:
+            s = s.encode("latin1").decode("utf-8")
+        except Exception:
+            pass
     s = re.sub(r"<br\s*/?>", " ", s, flags=re.I)
     s = re.sub(r"<[^>]+>", " ", s)
     s = s.replace("&amp;", "&")
@@ -78,6 +88,185 @@ def google_streetview_url(lat: float, lon: float) -> str:
 def apple_lookaround_url(lat: float, lon: float) -> str:
     # Opens Apple Maps centered at the coordinate; where Apple Look Around exists, user can enter Look Around.
     return f"https://maps.apple.com/?ll={lat:.7f},{lon:.7f}&q=Look%20Around"
+
+
+def geoboundaries_cache_path(adm: str, simplified: bool = True) -> Path:
+    suffix = "simplified" if simplified else "full"
+    return DATA_DIR / f"geoboundaries_prt_{adm.lower()}_{suffix}.geojson"
+
+
+def download_geoboundaries(adm: str, simplified: bool = True) -> dict | None:
+    """Download and cache Portugal boundaries from geoBoundaries."""
+    cache_path = geoboundaries_cache_path(adm, simplified)
+    if cache_path.exists():
+        try:
+            return json.loads(cache_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    try:
+        with urllib.request.urlopen(GEOBOUNDARIES_API.format(adm=adm), timeout=30) as response:
+            meta = json.loads(response.read().decode("utf-8"))
+        if simplified:
+            geojson_url = meta.get("simplifiedGeometryGeoJSON") or meta.get("gjDownloadURL")
+        else:
+            geojson_url = meta.get("gjDownloadURL") or meta.get("simplifiedGeometryGeoJSON")
+        if not geojson_url:
+            return None
+        with urllib.request.urlopen(geojson_url, timeout=60) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        cache_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        return data
+    except Exception:
+        return None
+
+
+def iter_rings(geometry: dict):
+    if not geometry:
+        return
+    geom_type = geometry.get("type")
+    coords = geometry.get("coordinates") or []
+    if geom_type == "Polygon":
+        for ring in coords:
+            yield ring
+    elif geom_type == "MultiPolygon":
+        for polygon in coords:
+            for ring in polygon:
+                yield ring
+
+
+def iter_polygons(geometry: dict):
+    if not geometry:
+        return
+    geom_type = geometry.get("type")
+    coords = geometry.get("coordinates") or []
+    if geom_type == "Polygon":
+        yield coords
+    elif geom_type == "MultiPolygon":
+        for polygon in coords:
+            yield polygon
+
+
+def point_in_ring(lon: float, lat: float, ring: list) -> bool:
+    inside = False
+    if len(ring) < 3:
+        return False
+    x1, y1 = ring[-1][0], ring[-1][1]
+    for point in ring:
+        x2, y2 = point[0], point[1]
+        crosses = (y1 > lat) != (y2 > lat)
+        if crosses:
+            x_at_lat = (x2 - x1) * (lat - y1) / ((y2 - y1) or 1e-12) + x1
+            if lon < x_at_lat:
+                inside = not inside
+        x1, y1 = x2, y2
+    return inside
+
+
+def point_in_geometry(lon: float, lat: float, geometry: dict) -> bool:
+    for polygon in iter_polygons(geometry) or []:
+        if not polygon:
+            continue
+        if point_in_ring(lon, lat, polygon[0]) and not any(point_in_ring(lon, lat, hole) for hole in polygon[1:]):
+            return True
+    return False
+
+
+def prepared_boundaries(adm: str) -> list[dict]:
+    data = download_geoboundaries(adm, simplified=False)
+    if not data:
+        return []
+    boundaries = []
+    for feature in data.get("features", []):
+        rings = list(iter_rings(feature.get("geometry")))
+        points = [point for ring in rings for point in ring]
+        if not points:
+            continue
+        lons = [point[0] for point in points]
+        lats = [point[1] for point in points]
+        boundaries.append(
+            {
+                "name": clean_text(feature.get("properties", {}).get("shapeName", "")),
+                "geometry": feature.get("geometry"),
+                "bbox": (min(lons), min(lats), max(lons), max(lats)),
+            }
+        )
+    return boundaries
+
+
+def locate_boundary(lat: float, lon: float, boundaries: list[dict]) -> str:
+    bbox_candidates = []
+    for boundary in boundaries:
+        min_lon, min_lat, max_lon, max_lat = boundary["bbox"]
+        if min_lon <= lon <= max_lon and min_lat <= lat <= max_lat:
+            if point_in_geometry(lon, lat, boundary["geometry"]):
+                return boundary["name"]
+            area = (max_lon - min_lon) * (max_lat - min_lat)
+            bbox_candidates.append((area, boundary["name"]))
+    if bbox_candidates:
+        return sorted(bbox_candidates, key=lambda item: item[0])[0][1]
+    return ""
+
+
+def infer_boundary_from_text(text: str, boundaries: list[dict]) -> str:
+    normalized = f" {normalize_boundary_text(text)} "
+    matches = []
+    for boundary in boundaries:
+        name = normalize_boundary_text(boundary["name"])
+        if name and f" {name} " in normalized:
+            matches.append((len(name), boundary["name"]))
+    if matches:
+        return sorted(matches, reverse=True)[0][1]
+    return ""
+
+
+def normalize_boundary_text(value: object) -> str:
+    value = unicodedata.normalize("NFKD", str(value or "")).encode("ascii", "ignore").decode("ascii")
+    value = re.sub(r"[^a-zA-Z0-9]+", " ", value.lower())
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def nearest_boundary(lat: float, lon: float, boundaries: list[dict]) -> str:
+    best = None
+    for boundary in boundaries:
+        min_lon, min_lat, max_lon, max_lat = boundary["bbox"]
+        center_lat = (min_lat + max_lat) / 2
+        center_lon = (min_lon + max_lon) / 2
+        score = (lat - center_lat) ** 2 + ((lon - center_lon) * math.cos(math.radians(lat))) ** 2
+        if best is None or score < best[0]:
+            best = (score, boundary["name"])
+    return best[1] if best else ""
+
+
+def enrich_with_admin_boundaries(df: pd.DataFrame) -> pd.DataFrame:
+    """Fill municipio/distrito from coordinates using geoBoundaries ADM2/ADM1."""
+    if df.empty:
+        return df
+    municipios = prepared_boundaries("ADM2")
+    distritos = prepared_boundaries("ADM1")
+    if not municipios and not distritos:
+        return df
+
+    out = df.copy()
+    geo_municipios = []
+    geo_distritos = []
+    for row in out.itertuples(index=False):
+        lat = float(row.latitude)
+        lon = float(row.longitude)
+        municipio = locate_boundary(lat, lon, municipios) if municipios else ""
+        if not municipio and municipios:
+            municipio = infer_boundary_from_text(f"{row.nome} {row.morada}", municipios)
+        if not municipio and municipios:
+            municipio = nearest_boundary(lat, lon, municipios)
+        geo_municipios.append(municipio)
+        geo_distritos.append(locate_boundary(lat, lon, distritos) if distritos else "")
+
+    out["municipio_geo"] = geo_municipios
+    out["distrito_geo"] = geo_distritos
+    out["municipio"] = np.where(out["municipio_geo"] != "", out["municipio_geo"], out["municipio"])
+    out["distrito"] = np.where(out["distrito_geo"] != "", out["distrito_geo"], out["distrito"])
+    out = out.drop(columns=["municipio_geo", "distrito_geo"])
+    return out
 
 
 def normalize_file(path: Path) -> pd.DataFrame:
@@ -165,6 +354,7 @@ def normalize_file(path: Path) -> pd.DataFrame:
     df = df[df["cadeia"].isin(["Volta", "Amanhecer", "Meu Super"])]
     df = df.dropna(subset=["latitude", "longitude"]).copy()
     df = df[(df["latitude"].between(30, 43.8)) & (df["longitude"].between(-32, -5))].copy()
+    df = enrich_with_admin_boundaries(df)
     df["street_view"] = [google_streetview_url(a, b) for a, b in zip(df.latitude, df.longitude)]
     df["apple_lookaround"] = [apple_lookaround_url(a, b) for a, b in zip(df.latitude, df.longitude)]
     df["coords"] = df.apply(lambda r: f"{r.latitude:.6f}, {r.longitude:.6f}", axis=1)
@@ -183,7 +373,7 @@ def load_data() -> pd.DataFrame:
 
 
 DF = load_data()
-CHAINS = sorted(DF["cadeia"].unique().tolist()) if not DF.empty and "cadeia" in DF.columns else []
+CHAINS = sorted(DF["cadeia"].unique().tolist())
 
 # A aplicação considera apenas interseções com a Volta.
 # Não calcular/mostrar Amanhecer x Meu Super.
@@ -229,12 +419,16 @@ def intersection_pairs(chain_a: str, chain_b: str, radius: int, max_rows: int = 
                     "cadeia_a": str(chain_a),
                     "loja_a": str(ra.nome),
                     "morada_a": str(ra.morada),
+                    "municipio_a": str(ra.municipio),
+                    "distrito_a": str(ra.distrito),
                     "lat_a": float(ra.latitude),
                     "lon_a": float(ra.longitude),
                     "row_id_b": int(rb.row_id) if "row_id" in rb.index else int(rb.name),
                     "cadeia_b": str(chain_b),
                     "loja_b": str(rb.nome),
                     "morada_b": str(rb.morada),
+                    "municipio_b": str(rb.municipio),
+                    "distrito_b": str(rb.distrito),
                     "lat_b": float(rb.latitude),
                     "lon_b": float(rb.longitude),
                     "dist_m": 0.0,
@@ -260,12 +454,16 @@ def intersection_pairs(chain_a: str, chain_b: str, radius: int, max_rows: int = 
                     "cadeia_a": str(chain_a),
                     "loja_a": str(ra.nome),
                     "morada_a": str(ra.morada),
+                    "municipio_a": str(ra.municipio),
+                    "distrito_a": str(ra.distrito),
                     "lat_a": float(ra.latitude),
                     "lon_a": float(ra.longitude),
                     "row_id_b": int(rb.row_id) if "row_id" in rb.index else int(rb.name),
                     "cadeia_b": str(chain_b),
                     "loja_b": str(rb.nome),
                     "morada_b": str(rb.morada),
+                    "municipio_b": str(rb.municipio),
+                    "distrito_b": str(rb.distrito),
                     "lat_b": float(rb.latitude),
                     "lon_b": float(rb.longitude),
                     "dist_m": float(d[j]),
@@ -374,9 +572,10 @@ def competition_map(df: pd.DataFrame, title: str):
     )
     fig.update_traces(hovertemplate="%{customdata[0]}<extra></extra>", customdata=tmp[["texto"]].to_numpy())
     fig.update_layout(mapbox_style="open-street-map", margin=dict(l=0, r=0, t=30, b=0), title=title, legend_title="Cadeia")
+    add_admin_boundary_layers(fig)
     return fig
 
-DF_COMP = nearest_competition(DF) if not DF.empty else DF.copy()
+DF_COMP = nearest_competition(DF)
 
 
 def kpi_card(label, value):
@@ -387,6 +586,37 @@ def empty_fig(message="Sem dados"):
     fig = go.Figure()
     fig.add_annotation(text=message, x=0.5, y=0.5, showarrow=False, font=dict(size=18, color="#64748b"))
     fig.update_layout(template="plotly_white", height=520, margin=dict(l=20, r=20, t=20, b=20))
+    return fig
+
+
+def add_admin_boundary_layers(fig, show_municipios: bool = True, show_distritos: bool = True):
+    layers = []
+    if show_municipios:
+        municipios = download_geoboundaries("ADM2", simplified=True)
+        if municipios:
+            layers.append(
+                {
+                    "sourcetype": "geojson",
+                    "source": municipios,
+                    "type": "line",
+                    "color": "rgba(15, 23, 42, 0.28)",
+                    "line": {"width": 0.7},
+                }
+            )
+    if show_distritos:
+        distritos = download_geoboundaries("ADM1", simplified=True)
+        if distritos:
+            layers.append(
+                {
+                    "sourcetype": "geojson",
+                    "source": distritos,
+                    "type": "line",
+                    "color": "rgba(220, 38, 38, 0.65)",
+                    "line": {"width": 1.8},
+                }
+            )
+    if layers:
+        fig.update_layout(mapbox_layers=layers)
     return fig
 
 
@@ -420,12 +650,13 @@ def map_fig(df: pd.DataFrame, title: str = "", color_by="cadeia", mode="Pontos")
             hover_data={"cadeia": True, "morada": True, "telefone": True, "email": True, "latitude": ":.6f", "longitude": ":.6f", "row_id": False},
         )
     fig.update_layout(mapbox_style="open-street-map", margin=dict(l=0, r=0, t=30, b=0), title=title, legend_title="Cadeia")
+    add_admin_boundary_layers(fig)
     fig.update_traces(marker=dict(opacity=0.82))
     return fig
 
 
 def chain_table(df: pd.DataFrame):
-    cols = ["nome", "cadeia", "morada", "telefone", "email", "horario", "servicos", "coords", "street_view", "apple_lookaround"]
+    cols = ["nome", "cadeia", "morada", "municipio", "distrito", "telefone", "email", "horario", "servicos", "coords", "street_view", "apple_lookaround"]
     out = df[cols].copy()
     out["street_view"] = out["street_view"].apply(lambda u: f"[Street View]({u})")
     out["apple_lookaround"] = out["apple_lookaround"].apply(lambda u: f"[Apple Look Around]({u})")
@@ -434,6 +665,7 @@ def chain_table(df: pd.DataFrame):
         data=out.to_dict("records"),
         columns=[
             {"name": "Loja", "id": "nome"}, {"name": "Cadeia", "id": "cadeia"}, {"name": "Morada", "id": "morada"},
+            {"name": "Município", "id": "municipio"}, {"name": "Distrito", "id": "distrito"},
             {"name": "Telefone", "id": "telefone"}, {"name": "Email", "id": "email"}, {"name": "Horário", "id": "horario"},
             {"name": "Serviços", "id": "servicos"}, {"name": "Coordenadas", "id": "coords"},
             {"name": "Street View", "id": "street_view", "presentation": "markdown"},
@@ -452,7 +684,7 @@ def chain_table(df: pd.DataFrame):
 def intersection_table(df: pd.DataFrame):
     if df.empty:
         return html.Div("Nenhuma interseção encontrada para o raio selecionado.", className="cardx small-note")
-    out = df[["cadeia_a", "loja_a", "cadeia_b", "loja_b", "dist_m", "street_view_a", "apple_lookaround_a", "street_view_b", "apple_lookaround_b"]].copy()
+    out = df[["cadeia_a", "loja_a", "municipio_a", "distrito_a", "cadeia_b", "loja_b", "municipio_b", "distrito_b", "dist_m", "street_view_a", "apple_lookaround_a", "street_view_b", "apple_lookaround_b"]].copy()
     out["dist_m"] = out["dist_m"].round(1)
     for c in ["street_view_a", "street_view_b"]:
         out[c] = out[c].apply(lambda u: f"[Street View]({u})")
@@ -462,7 +694,9 @@ def intersection_table(df: pd.DataFrame):
         data=out.to_dict("records"),
         columns=[
             {"name": "Cadeia A", "id": "cadeia_a"}, {"name": "Loja A", "id": "loja_a"},
+            {"name": "Município A", "id": "municipio_a"}, {"name": "Distrito A", "id": "distrito_a"},
             {"name": "Cadeia B", "id": "cadeia_b"}, {"name": "Loja B", "id": "loja_b"},
+            {"name": "Município B", "id": "municipio_b"}, {"name": "Distrito B", "id": "distrito_b"},
             {"name": "Distância (m)", "id": "dist_m", "type": "numeric"},
             {"name": "Street View A", "id": "street_view_a", "presentation": "markdown"},
             {"name": "Look Around A", "id": "apple_lookaround_a", "presentation": "markdown"},
@@ -500,6 +734,7 @@ def inter_map(df: pd.DataFrame):
         ))
     fig.update_layout(mapbox_style="open-street-map", height=620, margin=dict(l=0, r=0, t=20, b=0), legend_title="Cadeia")
     fig.update_mapboxes(center=dict(lat=float(pts.lat.mean()), lon=float(pts.lon.mean())), zoom=6)
+    add_admin_boundary_layers(fig)
     return fig
 
 
@@ -515,7 +750,12 @@ def sidebar():
         dcc.Link("🔢 Matriz", href="/matriz", className="side-link"),
         dcc.Link("⬢ Hexbin / Densidade", href="/densidade", className="side-link"),
         dcc.Link("🎯 Concorrência", href="/concorrencia", className="side-link"),
-        # Downloads desativados na versão Hugging Face Spaces
+        html.Div("Downloads", className="side-section"),
+        html.Button("CSV", id="download-csv-btn", className="btn btn-sm btn-light me-2"),
+        html.Button("Excel", id="download-xlsx-btn", className="btn btn-sm btn-outline-light"),
+        dcc.Download(id="download-csv"), dcc.Download(id="download-xlsx"),
+        dbc.Button("⬇ Download Interseções CSV", id="download-intersections-btn", color="success", className="w-100 mt-2"),
+        dcc.Download(id="download-intersections"),
     ], className="sidebar")
 
 
@@ -647,8 +887,7 @@ def page_statistics():
     ])
 
 
-app = Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP],
-          suppress_callback_exceptions=True)
+app = Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP], suppress_callback_exceptions=True)
 server = app.server
 app.layout = html.Div([dcc.Location(id="url"), sidebar(), html.Main(id="page", className="main")])
 
@@ -776,10 +1015,53 @@ def update_competition(base_chain, competitor_chain, radius):
         return dbc.Alert(f"Erro no cálculo de concorrência: {e}", color="danger"), empty_fig("Erro"), html.Div(str(e), className="small-note")
 
 
-# Callback dl_csv desativado
+@app.callback(Output("download-csv", "data"), Input("download-csv-btn", "n_clicks"), prevent_initial_call=True)
+def dl_csv(n):
+    # Gerar dados de concorrência (inclui as colunas dist_concorrente_m, concorrentes_no_raio, etc.)
+    df_combined = competition_dataset("Todas", "Todas", DEFAULT_RADIUS)
+
+    # Garantir tipo correcto na coluna de distância
+    if "dist_concorrente_m" in df_combined.columns:
+        df_combined["dist_concorrente_m"] = pd.to_numeric(df_combined["dist_concorrente_m"], errors="coerce")
+
+    # Garantir tipo correcto na coluna de contagem de concorrentes
+    if "concorrentes_no_raio" in df_combined.columns:
+        df_combined["concorrentes_no_raio"] = pd.to_numeric(df_combined["concorrentes_no_raio"], errors="coerce")
+
+    # Agregar por cadeia — as colunas já existem neste ponto
+    chain_aggregation = df_combined.groupby("cadeia").agg(
+        total_lojas=("nome", "count"),
+        media_distancia=("dist_concorrente_m", "mean"),
+        max_concorrentes=("concorrentes_no_raio", "max"),
+        lojas_com_concorrente=("dist_concorrente_m", lambda x: x.notna().sum())
+    ).reset_index()
+
+    # Renomear colunas para maior clareza
+    chain_aggregation.columns = [
+        "Cadeia",
+        "Total de Lojas",
+        "Distância Média (m)",
+        "Máx. Concorrentes",
+        "Lojas com Concorrência"
+    ]
+
+    # Substituir valores vazios nas colunas de texto de concorrência
+    for col in ["concorrente_mais_proximo", "loja_concorrente"]:
+        if col in df_combined.columns:
+            df_combined[col] = df_combined[col].replace("", "Nenhum")
+
+    # Exportar apenas o DataFrame principal (com colunas de concorrência já incluídas)
+    return dcc.send_data_frame(df_combined.to_csv, "geomarketing_dados_completo.csv", index=False, encoding="utf-8-sig")
 
 
-# Callback dl_xlsx desativado
+@app.callback(Output("download-xlsx", "data"), Input("download-xlsx-btn", "n_clicks"), prevent_initial_call=True)
+def dl_xlsx(n):
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        DF.to_excel(writer, index=False, sheet_name="lojas")
+        DF_COMP.to_excel(writer, index=False, sheet_name="concorrencia")
+    buf.seek(0)
+    return dcc.send_bytes(buf.getvalue(), "geomarketing_dados.xlsx")
 
 
 # Callbacks de Estatísticas
@@ -800,7 +1082,7 @@ def update_statistics(chain_filter):
 
         # Filtrar por cadeia
         if chain_filter != "Todas":
-            df = df[df["chain"] == chain_filter]
+            df = df[df["cadeia"] == chain_filter]
 
         # KPIs
         kpis = dbc.Row([
@@ -811,7 +1093,7 @@ def update_statistics(chain_filter):
         # Gráfico de barras - Quantidade por cadeia (se filtro de cadeia)
         if chain_filter == "Todas":
             # Mostrar todas as cadeias
-            chain_counts = df.groupby("chain").size().sort_values(ascending=False)
+            chain_counts = df.groupby("cadeia").size().sort_values(ascending=False)
             fig_bar_chain = go.Figure([
                 go.Bar(x=chain_counts.index, y=chain_counts.values, text=chain_counts.values, textposition="auto")
             ])
@@ -827,7 +1109,7 @@ def update_statistics(chain_filter):
             fig_bar_chain = empty_fig("Selecione 'Todas' para ver o comparativo entre cadeias")
 
         # Gráfico de barras - Quantidade por município
-        muni_counts = df.groupby("municipality").size().sort_values(ascending=False).head(15)
+        muni_counts = df.groupby("municipio").size().sort_values(ascending=False).head(15)
         fig_bar_muni = go.Figure([
             go.Bar(x=muni_counts.index, y=muni_counts.values, text=muni_counts.values, textposition="auto")
         ])
@@ -841,7 +1123,7 @@ def update_statistics(chain_filter):
         )
 
         # Gráfico de barras - Quantidade por distrito
-        district_counts = df.groupby("district").size().sort_values(ascending=False).head(15)
+        district_counts = df.groupby("distrito").size().sort_values(ascending=False).head(15)
         fig_bar_district = go.Figure([
             go.Bar(x=district_counts.index, y=district_counts.values, text=district_counts.values, textposition="auto")
         ])
@@ -856,7 +1138,7 @@ def update_statistics(chain_filter):
 
         # Gráfico de pizza - Distribuição por cadeia (se filtro for 'Todas')
         if chain_filter == "Todas":
-            chain_pie_counts = df.groupby("chain").size()
+            chain_pie_counts = df.groupby("cadeia").size()
             fig_pie_chain = go.Figure([
                 go.Pie(labels=chain_pie_counts.index, values=chain_pie_counts.values, hole=0.4)
             ])
@@ -870,11 +1152,11 @@ def update_statistics(chain_filter):
 
         # Tabela - Comparativo por cadeia (se filtro for 'Todas')
         if chain_filter == "Todas":
-            chain_stats = df.groupby("chain").agg({
-                "name": "count",
-                "municipality": lambda x: f"{x.nunique()} municípios",
-                "district": lambda x: f"{x.nunique()} distritos"
-            }).rename(columns={"name": "Total de lojas"})
+            chain_stats = df.groupby("cadeia").agg({
+                "nome": "count",
+                "municipio": lambda x: f"{x.nunique()} municípios",
+                "distrito": lambda x: f"{x.nunique()} distritos"
+            }).rename(columns={"nome": "Total de lojas", "municipio": "Municípios", "distrito": "Distritos"})
             chain_stats.index.name = "Cadeia"
             chain_stats.reset_index(inplace=True)
 
@@ -937,9 +1219,34 @@ def update_statistics(chain_filter):
 
 
 
-# Callback download_intersections desativado
+@app.callback(
+    Output("download-intersections","data"),
+    Input("download-intersections-btn","n_clicks"),
+    State("inter-pair","value"),
+    State("inter-radius","value"),
+    prevent_initial_call=True,
+)
+def download_intersections(n_clicks, pair_key, radius):
+    if n_clicks is None or n_clicks <= 0:
+        return None
+    try:
+        pair_key = pair_key or "Todas"
+        radius = int(radius or DEFAULT_RADIUS)
+        df = all_intersections(radius, pair_key or "Todas")
+        cols = ["cadeia_a", "loja_a", "morada_a", "municipio_a", "distrito_a", "lat_a", "lon_a",
+                "cadeia_b", "loja_b", "morada_b", "municipio_b", "distrito_b", "lat_b", "lon_b", "dist_m"]
+        df = df[cols]
+        if df.empty:
+            return None
+        filename = f"intersecoes_{pair_key.replace(' x ', '_')}_{radius}m.csv"
+        return dcc.send_data_frame(df.to_csv, filename, index=False, encoding="utf-8-sig")
+    except Exception:
+        return None
 
 
-# ── Arranque para Hugging Face Spaces ──
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=7860, debug=False, use_reloader=False)
+    app.run(
+        debug=True,
+        host="127.0.0.1",
+        port=8055
+    )
