@@ -7,6 +7,11 @@ import math
 import re
 import unicodedata
 import urllib.request
+import urllib.parse
+import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
+from datetime import datetime
+from html import unescape
 from pathlib import Path
 
 import dash
@@ -22,11 +27,92 @@ DATA_DIR = BASE_DIR / "data"
 GEOBOUNDARIES_API = "https://www.geoboundaries.org/api/current/gbOpen/PRT/{adm}/"
 
 CHAIN_COLORS = {
-    "Amanhecer": "#e63946",
-    "Meu Super": "#3b82f6",
-    "Volta": "#fb923c",
+    "Alcampo": "#f97316",
+    "Carrefour": "#2563eb",
+    "Dia": "#dc2626",
+    "Lidl": "#7c3aed",
+    "Mercadona": "#16a34a",
 }
 DEFAULT_RADIUS = 500
+ALIMARKET_RSS_FEEDS = [
+    "https://www.alimarket.es/media/rss/alimentacion.xml",
+    "https://www.alimarket.es/media/rss/sectores/alimentacion-sector-distribucion-base-alimentaria.xml",
+    "https://www.alimarket.es/media/rss/sectores/alimentacion-sector-alimentacion-y-bebidas.xml",
+    "https://www.alimarket.es/media/rss/sectores/alimentacion-sector-gran-consumo.xml",
+    "https://www.alimarket.es/media/rss/sectores/alimentacion-tiendas-de-conveniencia.xml",
+    "https://www.alimarket.es/media/rss/sectores/alimentacion-ecommerce-de-alimentacion.xml",
+    "https://www.alimarket.es/media/rss/sectores/alimentacion-coyuntura.xml",
+    "https://www.alimarket.es/media/rss/sectores/alimentacion-equipamiento-comercial.xml",
+]
+ALIMARKET_REPORT = "https://www.alimarket.es/alimentacion/informe/421975/informe-2026-sobre-la-distribucion-alimentaria-en-espana-por-superficie/informe-completo"
+ALIMARKET_FOOD_HOME = "https://www.alimarket.es/alimentacion"
+DATA_QUALITY_REPORT: list[dict] = []
+
+
+def load_market_news(limit: int = 12) -> list[dict]:
+    """Read public RSS metadata without reproducing subscriber-only content."""
+    items, seen = [], set()
+    for feed_url in ALIMARKET_RSS_FEEDS:
+        request = urllib.request.Request(feed_url, headers={"User-Agent": "GeomarketingDashboard/1.0"})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                root = ET.fromstring(response.read())
+            for item in root.findall(".//item"):
+                title = clean_text(item.findtext("title"))
+                link = clean_text(item.findtext("link"))
+                summary = clean_text(item.findtext("description"))
+                raw_date = clean_text(item.findtext("pubDate"))
+                if not title or not link or link in seen:
+                    continue
+                try:
+                    parsed_date = parsedate_to_datetime(raw_date)
+                    if parsed_date is None:
+                        raise ValueError("Data RSS vazia")
+                    date = parsed_date.strftime("%d/%m/%Y")
+                    sort_date = parsed_date.timestamp()
+                except Exception:
+                    try:
+                        parsed_date = datetime.fromisoformat(raw_date)
+                        date = parsed_date.strftime("%d/%m/%Y")
+                        sort_date = parsed_date.timestamp()
+                    except Exception:
+                        date, sort_date = raw_date, 0
+                seen.add(link)
+                items.append({"title": title, "link": link, "summary": summary[:280], "date": date, "sort_date": sort_date})
+        except Exception:
+            continue
+    return sorted(items, key=lambda item: item["sort_date"], reverse=True)[:limit]
+
+
+def load_featured_food_news(limit: int = 9) -> list[dict]:
+    """Extract public headline metadata from 'Destacado en Alimentación'."""
+    request = urllib.request.Request(ALIMARKET_FOOD_HOME, headers={"User-Agent": "Mozilla/5.0 GeomarketingDashboard/1.0"})
+    try:
+        with urllib.request.urlopen(request, timeout=8) as response:
+            page = response.read().decode("utf-8", errors="ignore")
+        start = page.find("Destacado en Alimentaci")
+        if start < 0:
+            return []
+        end = page.find("</section>", start)
+        section = page[start:end if end > start else start + 60000]
+        pattern = re.compile(
+            r'<h1[^>]*itemprop="headline"[^>]*>\s*<a href="([^"]+)"[^>]*>(.*?)</a>\s*</h1>\s*'
+            r'<meta[^>]*itemprop="dateCreated datePublished"[^>]*content="([^"]+)"',
+            re.I | re.S,
+        )
+        items = []
+        for link, title, raw_date in pattern.findall(section)[:limit]:
+            title = clean_text(unescape(title))
+            link = urllib.parse.urljoin(ALIMARKET_FOOD_HOME, unescape(link))
+            try:
+                date = datetime.fromisoformat(raw_date).strftime("%d/%m/%Y")
+            except Exception:
+                date = raw_date
+            if title and link:
+                items.append({"title": title, "link": link, "summary": "", "date": date, "sort_date": 0})
+        return items
+    except Exception:
+        return []
 
 
 def clean_text(x: object) -> str:
@@ -45,6 +131,47 @@ def clean_text(x: object) -> str:
     if s.lower() in {"nan", "none", "null"}:
         return ""
     return s
+
+
+def normalized_series(series: pd.Series) -> pd.Series:
+    """Lowercase/ascii representation used only for brand validation."""
+    return series.fillna("").astype(str).map(
+        lambda value: unicodedata.normalize("NFKD", value)
+        .encode("ascii", "ignore")
+        .decode("ascii")
+        .strip()
+        .lower()
+    )
+
+
+def filter_source_rows(raw: pd.DataFrame, cadeia: str, source: str) -> pd.DataFrame:
+    """Remove cross-brand contamination while retaining agreed store formats."""
+    brand = normalized_series(raw["marca"] if "marca" in raw else raw.get("brand", pd.Series(index=raw.index, dtype=str)))
+    name_col = next((c for c in ("nome", "name", "storeName") if c in raw.columns), None)
+    name = normalized_series(raw[name_col] if name_col else pd.Series(index=raw.index, dtype=str))
+    category = normalized_series(raw["category"] if "category" in raw else pd.Series(index=raw.index, dtype=str))
+
+    if cadeia == "Alcampo":
+        valid = brand.str.fullmatch(r"alcampo") | ((brand == "") & name.str.contains(r"\balcampo\b|\bmialcampo\b", regex=True))
+        valid &= ~name.str.contains(r"\bdia\b|mercadona|carrefour|\blidl\b", regex=True)
+    elif cadeia == "Dia":
+        valid_brands = {"dia", "dia market", "maxi dia", "la plaza de dia"}
+        valid = brand.isin(valid_brands) | ((brand == "") & name.str.contains(r"\bdia\b", regex=True))
+        valid &= ~name.str.contains(r"alcampo|mercadona|carrefour|\blidl\b", regex=True)
+    elif cadeia == "Mercadona":
+        valid = brand.eq("mercadona") | ((brand == "") & name.str.fullmatch(r"mercadona"))
+        valid &= ~name.str.contains(r"alcampo|carrefour|\blidl\b|\bdia\b", regex=True)
+    elif cadeia == "Carrefour":
+        # Express CEPSA, convenience formats and service-station shops are competitors.
+        valid = ~category.eq("agencia de viajes")
+    elif cadeia == "Lidl":
+        valid = pd.Series(True, index=raw.index)
+    else:
+        valid = pd.Series(False, index=raw.index)
+
+    removed = int((~valid).sum())
+    DATA_QUALITY_REPORT.append({"ficheiro": source, "cadeia": cadeia, "tipo": "marca/categoria inválida", "registos": removed})
+    return raw.loc[valid].copy()
 
 
 def clean_coord(value: object, kind: str, lat_for_lon: float | None = None) -> float | None:
@@ -72,8 +199,6 @@ def clean_coord(value: object, kind: str, lat_for_lon: float | None = None) -> f
                 cand = sign * (float(digits) / denom)
                 if -32 <= cand <= -5:
                     return cand
-    if lat_for_lon is not None and 36 <= lat_for_lon <= 43.5 and 0 < v < 10:
-        return -v
     if -32 <= v <= -5:
         return v
     if -180 <= v <= 180:
@@ -272,76 +397,44 @@ def enrich_with_admin_boundaries(df: pd.DataFrame) -> pd.DataFrame:
 def normalize_file(path: Path) -> pd.DataFrame:
     raw = pd.read_csv(path)
     fname = path.stem.lower()
-    if "amanhecer" in fname:
-        cadeia = "Amanhecer"
-        df = pd.DataFrame({
-            "id": raw.get("storeUrl", raw.index),
-            "nome": raw.get("name", ""),
-            "morada": raw.get("address", ""),
-            "codigo_postal": raw.get("postalCode", ""),
-            "municipio": raw.get("city", ""),
-            "distrito": raw.get("zone", ""),
-            "telefone": raw.get("phone", ""),
-            "email": raw.get("email", ""),
-            "horario": raw.get("hours", ""),
-            "servicos": "",
-            "latitude": raw.get("latitude", np.nan),
-            "longitude": raw.get("longitude", np.nan),
-        })
-    elif "meusuper" in fname or "meu_super" in fname:
-        cadeia = "Meu Super"
-        df = pd.DataFrame({
-            "id": raw.get("id", raw.index),
-            "nome": raw.get("nome", raw.get("name", "")),
-            "morada": raw.get("morada", raw.get("address", "")),
-            "codigo_postal": "",
-            "municipio": "",
-            "distrito": "",
-            "telefone": raw.get("telefone", ""),
-            "email": "",
-            "horario": raw.get("horario", raw.get("horarios", "")),
-            "servicos": raw.get("servicos", raw.get("servico", "")),
-            "latitude": raw.get("latitude", raw.get("lat", np.nan)),
-            "longitude": raw.get("longitude", raw.get("lng", np.nan)),
-        })
-    elif "volta" in fname:
-        cadeia = "Volta"
-        df = pd.DataFrame({
-            "id": raw.get("id", raw.index),
-            "nome": raw.get("titulo", raw.get("nome", "")),
-            "morada": raw.get("morada", raw.get("address", "")),
-            "codigo_postal": raw.get("cp", ""),
-            "municipio": raw.get("municipio", ""),
-            "distrito": raw.get("distrito", ""),
-            "telefone": raw.get("telefone", ""),
-            "email": raw.get("email", ""),
-            "horario": raw.get("horario", raw.get("horarios", "")),
-            "servicos": raw.get("servico", raw.get("servicos", "")),
-            "latitude": raw.get("lat", raw.get("latitude", np.nan)),
-            "longitude": raw.get("lng", raw.get("longitude", np.nan)),
-        })
-    else:
-        cadeia = path.stem.title()
-        cols = {c.lower(): c for c in raw.columns}
-        def pick(*names):
-            for n in names:
-                if n in cols:
-                    return raw[cols[n]]
-            return ""
-        df = pd.DataFrame({
-            "id": pick("id"),
-            "nome": pick("nome", "name", "titulo"),
-            "morada": pick("morada", "address"),
-            "codigo_postal": pick("cp", "postalcode", "codigo_postal"),
-            "municipio": pick("municipio", "city", "concelho"),
-            "distrito": pick("distrito", "zone"),
-            "telefone": pick("telefone", "phone"),
-            "email": pick("email"),
-            "horario": pick("horario", "horarios", "hours"),
-            "servicos": pick("servico", "servicos"),
-            "latitude": pick("latitude", "lat"),
-            "longitude": pick("longitude", "lng", "lon"),
-        })
+    chain_names = {
+        "alcampo": "Alcampo",
+        "carrefour": "Carrefour",
+        "dia": "Dia",
+        "lidl_espanha_lojas": "Lidl",
+        "mercadona": "Mercadona",
+    }
+    if fname not in chain_names:
+        return pd.DataFrame()
+    cadeia = chain_names[fname]
+    raw = filter_source_rows(raw, cadeia, path.name)
+    cols = {c.lower(): c for c in raw.columns}
+
+    def pick(*names):
+        for name in names:
+            if name in cols:
+                return raw[cols[name]]
+        return pd.Series([""] * len(raw), index=raw.index)
+
+    df = pd.DataFrame({
+        "id": pick("id", "osm_id", "objectnumber", "codsa"),
+        "nome": pick("nome", "name", "titulo", "storename"),
+        "morada": pick("morada", "morada_completa", "address", "address.streetname"),
+        "codigo_postal": pick("cp", "postalcode", "codigo_postal", "postal", "address.zip"),
+        "municipio": pick("municipio", "city", "cidade", "concelho", "address.city"),
+        "distrito": pick("distrito", "zone", "estado", "state", "address.state"),
+        "telefone": pick("telefone", "phone"),
+        "email": pick("email"),
+        "horario": pick("horario", "horarios", "hours", "hours1", "openinghours.items"),
+        "servicos": pick("servico", "servicos", "features", "marketingdata.infoicons"),
+        "latitude": pick("latitude", "lat", "address.latitude"),
+        "longitude": pick("longitude", "lng", "lon", "address.longitude"),
+    })
+
+    if "address.streetname" in cols:
+        street = raw[cols["address.streetname"]].fillna("").astype(str)
+        number = pick("address.streetnumber").fillna("").astype(str)
+        df["morada"] = (street + " " + number).str.strip()
 
     df["cadeia"] = cadeia
     for c in ["nome", "morada", "codigo_postal", "municipio", "distrito", "telefone", "email", "horario", "servicos"]:
@@ -350,11 +443,24 @@ def normalize_file(path: Path) -> pd.DataFrame:
     lon = [clean_coord(x, "lon", la) for x, la in zip(df["longitude"], lat)]
     df["latitude"] = lat
     df["longitude"] = lon
-    # Keep rows for volta, amanhecer, and meu super only
-    df = df[df["cadeia"].isin(["Volta", "Amanhecer", "Meu Super"])]
     df = df.dropna(subset=["latitude", "longitude"]).copy()
-    df = df[(df["latitude"].between(30, 43.8)) & (df["longitude"].between(-32, -5))].copy()
-    df = enrich_with_admin_boundaries(df)
+    # Península Ibérica, Baleares, Canárias e arquipélagos portugueses.
+    df = df[(df["latitude"].between(25, 46)) & (df["longitude"].between(-32, 6))].copy()
+    df["coord_key"] = df["latitude"].round(6).astype(str) + "|" + df["longitude"].round(6).astype(str)
+    duplicate_mask = df.duplicated("coord_key", keep=False)
+    conflicting = 0
+    if duplicate_mask.any():
+        conflicting = int(
+            df.loc[duplicate_mask]
+            .groupby("coord_key")["municipio"]
+            .nunique()
+            .gt(1)
+            .sum()
+        )
+    duplicate_rows = int(df.duplicated("coord_key", keep="first").sum())
+    DATA_QUALITY_REPORT.append({"ficheiro": path.name, "cadeia": cadeia, "tipo": "duplicados por coordenada removidos", "registos": duplicate_rows})
+    DATA_QUALITY_REPORT.append({"ficheiro": path.name, "cadeia": cadeia, "tipo": "coordenadas com cidades incompatíveis", "registos": conflicting})
+    df = df.drop_duplicates("coord_key", keep="first").drop(columns="coord_key")
     df["street_view"] = [google_streetview_url(a, b) for a, b in zip(df.latitude, df.longitude)]
     df["apple_lookaround"] = [apple_lookaround_url(a, b) for a, b in zip(df.latitude, df.longitude)]
     df["coords"] = df.apply(lambda r: f"{r.latitude:.6f}, {r.longitude:.6f}", axis=1)
@@ -375,9 +481,8 @@ def load_data() -> pd.DataFrame:
 DF = load_data()
 CHAINS = sorted(DF["cadeia"].unique().tolist())
 
-# A aplicação considera apenas interseções com a Volta.
-# Não calcular/mostrar Amanhecer x Meu Super.
-ALLOWED_INTERSECTION_PAIRS = [("Amanhecer", "Volta"), ("Meu Super", "Volta")]
+# Todas as combinações únicas entre cadeias, sem duplicar A x B / B x A.
+ALLOWED_INTERSECTION_PAIRS = list(itertools.combinations(CHAINS, 2))
 PAIR_OPTIONS = ["Todas"] + [f"{a} x {b}" for a, b in ALLOWED_INTERSECTION_PAIRS]
 
 
@@ -445,9 +550,20 @@ def intersection_pairs(chain_a: str, chain_b: str, radius: int, max_rows: int = 
         b_lat = b.latitude.to_numpy(dtype=float)
         b_lon = b.longitude.to_numpy(dtype=float)
         for _, ra in a.iterrows():
-            d = hdist_m(float(ra.latitude), float(ra.longitude), b_lat, b_lon)
-            idx = np.where(d <= radius)[0]
-            for j in idx:
+            lat0 = float(ra.latitude)
+            lon0 = float(ra.longitude)
+            lat_delta = radius / 111_320.0
+            lon_delta = radius / max(111_320.0 * math.cos(math.radians(lat0)), 1.0)
+            candidates = np.where(
+                (np.abs(b_lat - lat0) <= lat_delta) &
+                (np.abs(b_lon - lon0) <= lon_delta)
+            )[0]
+            if not len(candidates):
+                continue
+            d = hdist_m(lat0, lon0, b_lat[candidates], b_lon[candidates])
+            local_matches = np.where(d <= radius)[0]
+            for local_idx in local_matches:
+                j = int(candidates[local_idx])
                 rb = b.iloc[int(j)]
                 rows.append({
                     "row_id_a": int(ra.row_id) if "row_id" in ra.index else int(ra.name),
@@ -466,7 +582,7 @@ def intersection_pairs(chain_a: str, chain_b: str, radius: int, max_rows: int = 
                     "distrito_b": str(rb.distrito),
                     "lat_b": float(rb.latitude),
                     "lon_b": float(rb.longitude),
-                    "dist_m": float(d[j]),
+                    "dist_m": float(d[local_idx]),
                     "street_view_a": str(ra.street_view),
                     "apple_lookaround_a": str(ra.apple_lookaround),
                     "street_view_b": str(rb.street_view),
@@ -527,7 +643,7 @@ def competition_dataset(base_chain: str = "Todas", competitor_chain: str = "Toda
         if competitor_chain != "Todas":
             other = other[other.cadeia == competitor_chain]
         if other.empty:
-            rows.append({**r.to_dict(), "dist_concorrente_m": np.nan, "concorrente_mais_proximo": "", "loja_concorrente": "", "concorrentes_no_raio": 0})
+            rows.append({**r.to_dict(), "dist_concorrente_m": np.nan, "concorrente_mais_proximo": "", "loja_concorrente": "", "morada_concorrente": "", "lat_concorrente": np.nan, "lon_concorrente": np.nan, "concorrentes_no_raio": 0})
             continue
 
         if radius <= 0:
@@ -535,18 +651,18 @@ def competition_dataset(base_chain: str = "Todas", competitor_chain: str = "Toda
             keys = other.apply(lambda x: f"{float(x.latitude):.6f}|{float(x.longitude):.6f}", axis=1)
             exact = other[keys == key]
             if exact.empty:
-                rows.append({**r.to_dict(), "dist_concorrente_m": np.nan, "concorrente_mais_proximo": "", "loja_concorrente": "", "concorrentes_no_raio": 0})
+                rows.append({**r.to_dict(), "dist_concorrente_m": np.nan, "concorrente_mais_proximo": "", "loja_concorrente": "", "morada_concorrente": "", "lat_concorrente": np.nan, "lon_concorrente": np.nan, "concorrentes_no_raio": 0})
             else:
                 rb = exact.iloc[0]
-                rows.append({**r.to_dict(), "dist_concorrente_m": 0.0, "concorrente_mais_proximo": str(rb.cadeia), "loja_concorrente": str(rb.nome), "concorrentes_no_raio": int(len(exact))})
+                rows.append({**r.to_dict(), "dist_concorrente_m": 0.0, "concorrente_mais_proximo": str(rb.cadeia), "loja_concorrente": str(rb.nome), "morada_concorrente": str(rb.morada), "lat_concorrente": float(rb.latitude), "lon_concorrente": float(rb.longitude), "concorrentes_no_raio": int(len(exact))})
         else:
             d = hdist_m(float(r.latitude), float(r.longitude), other.latitude.to_numpy(dtype=float), other.longitude.to_numpy(dtype=float))
             if len(d) == 0:
-                rows.append({**r.to_dict(), "dist_concorrente_m": np.nan, "concorrente_mais_proximo": "", "loja_concorrente": "", "concorrentes_no_raio": 0})
+                rows.append({**r.to_dict(), "dist_concorrente_m": np.nan, "concorrente_mais_proximo": "", "loja_concorrente": "", "morada_concorrente": "", "lat_concorrente": np.nan, "lon_concorrente": np.nan, "concorrentes_no_raio": 0})
                 continue
             j = int(np.argmin(d))
             rb = other.iloc[j]
-            rows.append({**r.to_dict(), "dist_concorrente_m": float(d[j]), "concorrente_mais_proximo": str(rb.cadeia), "loja_concorrente": str(rb.nome), "concorrentes_no_raio": int((d <= radius).sum())})
+            rows.append({**r.to_dict(), "dist_concorrente_m": float(d[j]), "concorrente_mais_proximo": str(rb.cadeia), "loja_concorrente": str(rb.nome), "morada_concorrente": str(rb.morada), "lat_concorrente": float(rb.latitude), "lon_concorrente": float(rb.longitude), "concorrentes_no_raio": int((d <= radius).sum())})
 
     out = pd.DataFrame(rows)
     text_cols = ["cadeia", "nome", "morada", "telefone", "email", "horario", "servicos", "concorrente_mais_proximo", "loja_concorrente"]
@@ -562,17 +678,36 @@ def competition_map(df: pd.DataFrame, title: str):
     tmp = df.copy()
     tmp = tmp[tmp["concorrentes_no_raio"].fillna(0).astype(int) > 0].copy()
     if tmp.empty:
-        return empty_fig("Nenhuma coincidência/interseção para os filtros selecionados")
-    tmp["dist_plot"] = tmp["dist_concorrente_m"].fillna(-1)
-    tmp["texto"] = tmp.apply(lambda r: f"<b>{r.nome}</b><br>Cadeia: {r.cadeia}<br>Concorrente: {r.concorrente_mais_proximo}<br>Loja concorrente: {r.loja_concorrente}<br>Distância: {r.dist_concorrente_m:.1f} m<br>Concorrentes no raio: {int(r.concorrentes_no_raio)}", axis=1)
-    fig = px.scatter_mapbox(
-        tmp, lat="latitude", lon="longitude", color="cadeia", size="concorrentes_no_raio",
-        color_discrete_map=CHAIN_COLORS, zoom=5.2, height=620,
-        hover_name="nome", hover_data={"latitude": False, "longitude": False, "row_id": False, "dist_plot": False},
+        return empty_fig("Nenhuma concorrência para os filtros selecionados")
+    fig = go.Figure()
+    line_lats, line_lons = [], []
+    for row in tmp.itertuples(index=False):
+        line_lats.extend([row.latitude, row.lat_concorrente, None])
+        line_lons.extend([row.longitude, row.lon_concorrente, None])
+    fig.add_trace(go.Scattermapbox(
+        lat=line_lats, lon=line_lons, mode="lines",
+        line={"width": 1.2, "color": "rgba(71,85,105,.38)"},
+        hoverinfo="skip", name="Ligação ao mais próximo",
+    ))
+    base_points = tmp[["cadeia", "nome", "morada", "latitude", "longitude"]].copy()
+    competitor_points = tmp[["concorrente_mais_proximo", "loja_concorrente", "morada_concorrente", "lat_concorrente", "lon_concorrente"]].copy()
+    competitor_points.columns = ["cadeia", "nome", "morada", "latitude", "longitude"]
+    competitor_points = competitor_points.drop_duplicates(["cadeia", "latitude", "longitude"])
+    for role, points in (("Base", base_points), ("Concorrente", competitor_points)):
+        for chain, sub in points.groupby("cadeia"):
+            fig.add_trace(go.Scattermapbox(
+                lat=sub.latitude, lon=sub.longitude, mode="markers",
+                marker={"size": 14 if role == "Base" else 10, "color": CHAIN_COLORS.get(chain, "#111827"), "opacity": .88},
+                text=sub.apply(lambda r: f"<b>{r.nome}</b><br>{role}: {chain}<br>{r.morada}", axis=1),
+                hovertemplate="%{text}<extra></extra>", name=f"{chain} · {role}",
+            ))
+    all_lats = pd.concat([tmp.latitude, tmp.lat_concorrente]).dropna()
+    all_lons = pd.concat([tmp.longitude, tmp.lon_concorrente]).dropna()
+    fig.update_layout(
+        mapbox_style="open-street-map", height=620, margin=dict(l=0, r=0, t=30, b=0),
+        title=title, legend_title="Cadeia e papel",
+        mapbox_center={"lat": float(all_lats.mean()), "lon": float(all_lons.mean())}, mapbox_zoom=5.2,
     )
-    fig.update_traces(hovertemplate="%{customdata[0]}<extra></extra>", customdata=tmp[["texto"]].to_numpy())
-    fig.update_layout(mapbox_style="open-street-map", margin=dict(l=0, r=0, t=30, b=0), title=title, legend_title="Cadeia")
-    add_admin_boundary_layers(fig)
     return fig
 
 DF_COMP = nearest_competition(DF)
@@ -650,8 +785,68 @@ def map_fig(df: pd.DataFrame, title: str = "", color_by="cadeia", mode="Pontos")
             hover_data={"cadeia": True, "morada": True, "telefone": True, "email": True, "latitude": ":.6f", "longitude": ":.6f", "row_id": False},
         )
     fig.update_layout(mapbox_style="open-street-map", margin=dict(l=0, r=0, t=30, b=0), title=title, legend_title="Cadeia")
-    add_admin_boundary_layers(fig)
     fig.update_traces(marker=dict(opacity=0.82))
+    return fig
+
+
+def heatmap_fig(df: pd.DataFrame, title: str = ""):
+    """Continuous density surface calculated from the store points."""
+    if df.empty:
+        return empty_fig("Sem lojas para apresentar")
+    fig = px.density_mapbox(
+        df,
+        lat="latitude",
+        lon="longitude",
+        radius=18,
+        zoom=5.0,
+        height=620,
+        color_continuous_scale=[
+            [0.0, "rgba(37,99,235,0)"],
+            [0.25, "#22c55e"],
+            [0.55, "#facc15"],
+            [0.8, "#f97316"],
+            [1.0, "#dc2626"],
+        ],
+        hover_data={"latitude": ":.5f", "longitude": ":.5f"},
+    )
+    fig.update_layout(
+        mapbox_style="open-street-map",
+        margin=dict(l=0, r=0, t=30, b=0),
+        title=title,
+        coloraxis_colorbar_title="Densidade",
+    )
+    return fig
+
+
+def cluster_fig(df: pd.DataFrame, title: str = ""):
+    """Client-side Mapbox clusters that expand as the user zooms in."""
+    if df.empty:
+        return empty_fig("Sem lojas para apresentar")
+    fig = go.Figure()
+    for cadeia, group in df.groupby("cadeia", sort=False):
+        hover = group.apply(
+            lambda r: f"<b>{r.nome}</b><br>{r.morada}<br>{r.municipio}<br>{r.latitude:.6f}, {r.longitude:.6f}",
+            axis=1,
+        )
+        color = CHAIN_COLORS.get(str(cadeia), "#2563eb")
+        fig.add_trace(go.Scattermapbox(
+            lat=group.latitude,
+            lon=group.longitude,
+            mode="markers",
+            marker={"size": 11, "color": color, "opacity": 0.82},
+            cluster={"enabled": True, "maxzoom": 13, "step": 20, "size": 34, "color": color, "opacity": 0.82},
+            text=hover,
+            hovertemplate="%{text}<extra></extra>",
+            name=str(cadeia),
+        ))
+    fig.update_layout(
+        mapbox_style="open-street-map",
+        mapbox_center={"lat": float(df.latitude.mean()), "lon": float(df.longitude.mean())},
+        mapbox_zoom=5.0,
+        height=620,
+        margin=dict(l=0, r=0, t=30, b=0),
+        title=title,
+    )
     return fig
 
 
@@ -684,7 +879,9 @@ def chain_table(df: pd.DataFrame):
 def intersection_table(df: pd.DataFrame):
     if df.empty:
         return html.Div("Nenhuma interseção encontrada para o raio selecionado.", className="cardx small-note")
-    out = df[["cadeia_a", "loja_a", "municipio_a", "distrito_a", "cadeia_b", "loja_b", "municipio_b", "distrito_b", "dist_m", "street_view_a", "apple_lookaround_a", "street_view_b", "apple_lookaround_b"]].copy()
+    out = df[["cadeia_a", "loja_a", "lat_a", "lon_a", "municipio_a", "distrito_a", "cadeia_b", "loja_b", "lat_b", "lon_b", "municipio_b", "distrito_b", "dist_m", "street_view_a", "apple_lookaround_a", "street_view_b", "apple_lookaround_b"]].copy()
+    out["ponto_a"] = out.apply(lambda r: f"{r.lat_a:.6f}, {r.lon_a:.6f}", axis=1)
+    out["ponto_b"] = out.apply(lambda r: f"{r.lat_b:.6f}, {r.lon_b:.6f}", axis=1)
     out["dist_m"] = out["dist_m"].round(1)
     for c in ["street_view_a", "street_view_b"]:
         out[c] = out[c].apply(lambda u: f"[Street View]({u})")
@@ -694,10 +891,12 @@ def intersection_table(df: pd.DataFrame):
         data=out.to_dict("records"),
         columns=[
             {"name": "Cadeia A", "id": "cadeia_a"}, {"name": "Loja A", "id": "loja_a"},
-            {"name": "Município A", "id": "municipio_a"}, {"name": "Distrito A", "id": "distrito_a"},
+            {"name": "Ponto A", "id": "ponto_a"},
             {"name": "Cadeia B", "id": "cadeia_b"}, {"name": "Loja B", "id": "loja_b"},
-            {"name": "Município B", "id": "municipio_b"}, {"name": "Distrito B", "id": "distrito_b"},
+            {"name": "Ponto B", "id": "ponto_b"},
             {"name": "Distância (m)", "id": "dist_m", "type": "numeric"},
+            {"name": "Município A", "id": "municipio_a"}, {"name": "Distrito A", "id": "distrito_a"},
+            {"name": "Município B", "id": "municipio_b"}, {"name": "Distrito B", "id": "distrito_b"},
             {"name": "Street View A", "id": "street_view_a", "presentation": "markdown"},
             {"name": "Look Around A", "id": "apple_lookaround_a", "presentation": "markdown"},
             {"name": "Street View B", "id": "street_view_b", "presentation": "markdown"},
@@ -706,7 +905,7 @@ def intersection_table(df: pd.DataFrame):
         page_size=12,
         filter_action="native",
         sort_action="native",
-        style_table={"overflowX": "auto"},
+        style_table={"overflowX": "auto", "minWidth": "100%"},
         style_cell={"fontFamily": "Inter, Segoe UI, Arial", "fontSize": 13, "padding": "9px", "textAlign": "left", "maxWidth": 280, "whiteSpace": "normal"},
         style_header={"fontWeight": "800", "backgroundColor": "#f8fafc"},
         markdown_options={"link_target": "_blank"},
@@ -734,7 +933,35 @@ def inter_map(df: pd.DataFrame):
         ))
     fig.update_layout(mapbox_style="open-street-map", height=620, margin=dict(l=0, r=0, t=20, b=0), legend_title="Cadeia")
     fig.update_mapboxes(center=dict(lat=float(pts.lat.mean()), lon=float(pts.lon.mean())), zoom=6)
-    add_admin_boundary_layers(fig)
+    return fig
+
+
+def intersection_heatmap(df: pd.DataFrame):
+    """Density of competitive pressure, weighted by intersection relationships."""
+    if df.empty:
+        return empty_fig("Sem interseções para o heatmap")
+    pts_a = df[["cadeia_a", "loja_a", "lat_a", "lon_a"]].rename(
+        columns={"cadeia_a": "cadeia", "loja_a": "loja", "lat_a": "lat", "lon_a": "lon"}
+    )
+    pts_b = df[["cadeia_b", "loja_b", "lat_b", "lon_b"]].rename(
+        columns={"cadeia_b": "cadeia", "loja_b": "loja", "lat_b": "lat", "lon_b": "lon"}
+    )
+    pressure = pd.concat([pts_a, pts_b], ignore_index=True)
+    pressure = pressure.groupby(["cadeia", "loja", "lat", "lon"], as_index=False).size().rename(columns={"size": "intersecoes"})
+    fig = px.density_mapbox(
+        pressure, lat="lat", lon="lon", z="intersecoes", radius=24,
+        color_continuous_scale=[
+            [0.0, "rgba(37,99,235,0)"], [0.25, "#22c55e"],
+            [0.55, "#facc15"], [0.8, "#f97316"], [1.0, "#dc2626"],
+        ],
+        hover_name="loja", hover_data={"cadeia": True, "intersecoes": True, "lat": False, "lon": False},
+        zoom=5.2, height=620,
+    )
+    fig.update_layout(
+        mapbox_style="open-street-map", margin=dict(l=0, r=0, t=30, b=0),
+        title="Pressão concorrencial", coloraxis_colorbar_title="Interseções",
+        mapbox_center={"lat": float(pressure.lat.mean()), "lon": float(pressure.lon.mean())},
+    )
     return fig
 
 
@@ -748,8 +975,12 @@ def sidebar():
         html.Div("Análise espacial", className="side-section"),
         dcc.Link("📍 Interseções", href="/intersecoes", className="side-link"),
         dcc.Link("🔢 Matriz", href="/matriz", className="side-link"),
+        dcc.Link("🟠 Clusters", href="/clusters", className="side-link"),
         dcc.Link("⬢ Hexbin / Densidade", href="/densidade", className="side-link"),
         dcc.Link("🎯 Concorrência", href="/concorrencia", className="side-link"),
+        dcc.Link("📊 Estatísticas", href="/estatisticas", className="side-link"),
+        dcc.Link("📰 News", href="/news", className="side-link"),
+        dcc.Link("✅ Qualidade dos dados", href="/qualidade", className="side-link"),
         html.Div("Downloads", className="side-section"),
         html.Button("CSV", id="download-csv-btn", className="btn btn-sm btn-light me-2"),
         html.Button("Excel", id="download-xlsx-btn", className="btn btn-sm btn-outline-light"),
@@ -761,7 +992,7 @@ def sidebar():
 
 def page_dashboard():
     counts = DF.groupby("cadeia").size().reset_index(name="lojas")
-    fig_bar = px.bar(counts, x="cadeia", y="lojas", color="cadeia", color_discrete_map=CHAIN_COLORS, text="lojas", height=360)
+    fig_bar = px.bar(counts, x="cadeia", y="lojas", color="cadeia", color_discrete_map=CHAIN_COLORS, text="lojas", height=620)
     fig_bar.update_layout(showlegend=False, margin=dict(l=20, r=20, t=20, b=20), template="plotly_white")
     return html.Div([
         html.H1("Plataforma GIS de Geomarketing", className="page-title"),
@@ -773,8 +1004,8 @@ def page_dashboard():
             kpi_card("Com email", int((DF.email != "").sum())),
         ], className="g-3 mb-4"),
         dbc.Row([
-            dbc.Col(html.Div(dcc.Graph(figure=map_fig(DF, "Mapa geral", "cadeia", "Pontos")), className="cardx"), md=8),
-            dbc.Col(html.Div(dcc.Graph(figure=fig_bar), className="cardx"), md=4),
+            dbc.Col(html.Div(dcc.Graph(figure=map_fig(DF, "Mapa geral", "cadeia", "Pontos"), responsive=True), className="cardx"), lg=8, md=12),
+            dbc.Col(html.Div(dcc.Graph(figure=fig_bar, responsive=True), className="cardx"), lg=4, md=12),
         ], className="g-3"),
     ])
 
@@ -783,38 +1014,56 @@ def page_chain(cadeia: str):
     df = DF[DF.cadeia == cadeia].copy()
     return html.Div([
         html.H1(cadeia, className="page-title"),
-        html.P("Mapa, dados e estatísticas da cadeia selecionada.", className="subtitle"),
+        html.P("Pontos, densidade e clusters da cadeia selecionada.", className="subtitle"),
         dbc.Row([
             kpi_card("Lojas", len(df)),
             kpi_card("Com telefone", int((df.telefone != "").sum())),
             kpi_card("Com email", int((df.email != "").sum())),
             kpi_card("Municípios", int(df.municipio.replace('', np.nan).nunique())),
         ], className="g-3 mb-4"),
-        html.Div([
-            dbc.Row([
-                dbc.Col(dcc.Dropdown(["Pontos", "Hexbin / Densidade", "Distância ao concorrente"], "Pontos", id="chain-map-mode", clearable=False), md=4),
-            ], className="mb-3"),
-            dcc.Graph(id="chain-map", figure=map_fig(df, f"Mapa - {cadeia}")),
-        ], className="cardx mb-4"),
+        html.Div(
+            [
+                dcc.Store(id="chain-current", data=cadeia),
+                dbc.Tabs(
+                    [
+                        dbc.Tab(label="Mapa e pontos", tab_id="points"),
+                        dbc.Tab(label="Heatmap", tab_id="heatmap"),
+                        dbc.Tab(label="Clusters", tab_id="clusters"),
+                    ],
+                    id="chain-view-tabs",
+                    active_tab="points",
+                    className="chain-tabs",
+                ),
+                dcc.Loading(
+                    dcc.Graph(id="chain-view-graph", responsive=True, style={"width": "100%", "height": "68vh", "minHeight": "620px"}),
+                    type="circle",
+                ),
+            ],
+            className="cardx mb-4",
+        ),
         html.Div(chain_table(df), className="cardx"),
     ])
 
 
 def page_intersections():
     pair_opts = PAIR_OPTIONS
+    default_pair = pair_opts[1] if len(pair_opts) > 1 else "Todas"
     return html.Div([
         html.H1("Interseções", className="page-title"),
         html.P("Identifica exatamente quais lojas ficam próximas entre redes. Sem heatmap borrado.", className="subtitle"),
         html.Div([
             dbc.Row([
-                dbc.Col([html.Label("Par de cadeias", className="fw-bold"), dcc.Dropdown(pair_opts, "Todas", id="inter-pair", clearable=False)], md=3),
+                dbc.Col([html.Label("Par de cadeias", className="fw-bold"), dcc.Dropdown(pair_opts, default_pair, id="inter-pair", clearable=False)], md=3),
                 dbc.Col([html.Label("Raio de interseção (m)", className="fw-bold"), dcc.Slider(0, 2000, value=500, marks={0:"0",50:"50",250:"250",500:"500",1000:"1 km",2000:"2 km"}, id="inter-radius")], md=7),
                 dbc.Col([html.Label(" "), dbc.Input(id="inter-radius-input", value=500, type="number", min=0, max=5000)], md=2),
             ])
         ], className="cardx mb-4"),
         html.Div(id="inter-kpis", className="mb-4"),
-        html.Div(dcc.Graph(id="inter-map"), className="cardx mb-4"),
-        html.Div(id="inter-table-wrap", className="cardx"),
+        dbc.Row([
+            dbc.Col(html.Div(dcc.Graph(id="inter-map", responsive=True), className="cardx"), lg=6, md=12),
+            dbc.Col(html.Div(dcc.Graph(id="inter-heatmap", responsive=True), className="cardx"), lg=6, md=12),
+        ], className="g-3 mb-4 intersection-maps"),
+        html.Div(id="inter-table-wrap", className="cardx table-card"),
     ])
 
 
@@ -835,6 +1084,50 @@ def page_density():
     ])
 
 
+def page_clusters():
+    return html.Div([
+        html.H1("Clusters de lojas", className="page-title"),
+        html.P(
+            "Aglomerações comerciais interativas por cadeia. Aumente o zoom para expandir cada cluster e ver as lojas.",
+            className="subtitle",
+        ),
+        dbc.Row([
+            kpi_card("Lojas agrupáveis", f"{len(DF):,}".replace(",", ".")),
+            kpi_card("Cadeias", len(CHAINS)),
+            kpi_card("Zoom de expansão", "até 13"),
+            kpi_card("Passo do cluster", "20 pontos"),
+        ], className="g-3 mb-4"),
+        html.Div(
+            dcc.Graph(figure=cluster_fig(DF, "Clusters comerciais por cadeia"), responsive=True),
+            className="cardx",
+        ),
+        html.P(
+            "Os círculos representam concentrações de lojas, não limites oficiais de aglomerações urbanas.",
+            className="small-note mt-2",
+        ),
+    ])
+
+
+def page_data_quality():
+    report = pd.DataFrame(DATA_QUALITY_REPORT)
+    report = report[report["registos"] > 0].copy() if not report.empty else report
+    return html.Div([
+        html.H1("Qualidade dos dados", className="page-title"),
+        html.P("Registos excluídos ou sinalizados durante o carregamento dos datasets.", className="subtitle"),
+        html.Div(
+            dash_table.DataTable(
+                data=report.to_dict("records"),
+                columns=[{"name": c.replace("_", " ").title(), "id": c} for c in report.columns],
+                sort_action="native",
+                page_size=20,
+                style_cell={"padding": "12px", "textAlign": "left"},
+                style_header={"fontWeight": "800", "backgroundColor": "#f8fafc"},
+            ) if not report.empty else dbc.Alert("Nenhuma anomalia detetada.", color="success"),
+            className="cardx",
+        ),
+    ])
+
+
 def page_competition():
     chain_opts = ["Todas"] + CHAINS
     return html.Div([
@@ -844,8 +1137,7 @@ def page_competition():
             dbc.Row([
                 dbc.Col([html.Label("Cadeia base", className="fw-bold"), dcc.Dropdown(chain_opts, "Todas", id="comp-base", clearable=False)], md=3),
                 dbc.Col([html.Label("Concorrente", className="fw-bold"), dcc.Dropdown(chain_opts, "Todas", id="comp-target", clearable=False)], md=3),
-                dbc.Col([html.Label("Raio (m)", className="fw-bold"), dcc.Slider(0, 2000, value=500, marks={0:"0",50:"50",250:"250",500:"500",1000:"1 km",2000:"2 km"}, id="comp-radius")], md=4),
-                dbc.Col([html.Label(" "), dbc.Input(id="comp-radius-input", value=500, type="number", min=0, max=5000)], md=2),
+                dbc.Col([html.Label("Raio (m)", className="fw-bold"), dcc.Slider(0, 2000, value=500, marks={0:"0",50:"50",250:"250",500:"500",1000:"1 km",2000:"2 km"}, id="comp-radius")], md=6),
             ])
         ], className="cardx mb-4"),
         html.Div(id="comp-kpis", className="mb-4"),
@@ -858,7 +1150,7 @@ def page_statistics():
     chain_opts = ["Todas"] + CHAINS
     return html.Div([
         html.H1("Estatísticas por Cadeia", className="page-title"),
-        html.P("Comparativo detalhado entre cadeias, municipios e distritos.", className="subtitle"),
+        html.P("Comparativo detalhado entre cadeias, municípios e distritos.", className="subtitle"),
 
         # Filtros
         html.Div([
@@ -882,14 +1174,81 @@ def page_statistics():
 
         dbc.Row([
             dbc.Col([dcc.Graph(id="stat-pie-chain")], md=6),
-            dbc.Col([dcc.Graph(id="stat-table-chain")], md=6),
+            dbc.Col([html.Div(id="stat-table-chain", className="cardx h-100")], md=6),
         ], className="g-3"),
+    ])
+
+
+def page_news():
+    return html.Div([
+        html.H1("Destacado en Alimentación", className="page-title news-heading"),
+        html.P("Atualizações públicas sobre distribuição alimentar. Os artigos abrem sempre na fonte original.", className="subtitle"),
+        html.Div([
+            dbc.Button("↻ Atualizar agora", id="news-refresh", color="success", size="sm"),
+            html.Span(id="news-updated-at", className="news-updated-at"),
+        ], className="news-toolbar"),
+        dcc.Interval(id="news-interval", interval=15 * 60 * 1000, n_intervals=0),
+        html.Div(id="news-content"),
+    ])
+
+
+def render_news_content(news: list[dict]):
+    cards = [
+        html.Div([
+            html.A(item["title"], href=item["link"], target="_blank", rel="noopener noreferrer", className="news-title"),
+        ], className="news-card")
+        for item in news
+    ]
+    if not cards:
+        cards = [dbc.Alert(
+            "O feed de notícias está temporariamente indisponível. Use os links abaixo para consultar as fontes.",
+            color="warning",
+        )]
+    return html.Div([
+        html.Div([
+            html.Span("Relatório permanente", className="news-report-label"),
+            html.A(
+                "Informe 2026 sobre la Distribución Alimentaria en España por superficie ↗",
+                href=ALIMARKET_REPORT,
+                target="_blank",
+                rel="noopener noreferrer",
+                className="news-report-link",
+            ),
+        ], className="news-report"),
+        html.Div(cards, className="news-grid"),
+        html.P("Fonte: página pública Alimentación, Alimarket. Clique numa manchete para abrir o artigo original.", className="small-note"),
     ])
 
 
 app = Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP], suppress_callback_exceptions=True)
 server = app.server
 app.layout = html.Div([dcc.Location(id="url"), sidebar(), html.Main(id="page", className="main")])
+
+
+@app.callback(
+    Output("chain-view-graph", "figure"),
+    Input("chain-view-tabs", "active_tab"),
+    State("chain-current", "data"),
+)
+def update_chain_map(active_tab, cadeia):
+    df = DF[DF.cadeia == cadeia].copy()
+    if active_tab == "heatmap":
+        return heatmap_fig(df, f"Heatmap - {cadeia}")
+    if active_tab == "clusters":
+        return cluster_fig(df, f"Clusters - {cadeia}")
+    return map_fig(df, f"Pontos - {cadeia}")
+
+
+@app.callback(
+    Output("news-content", "children"),
+    Output("news-updated-at", "children"),
+    Input("news-interval", "n_intervals"),
+    Input("news-refresh", "n_clicks"),
+)
+def refresh_market_news(_intervals, _clicks):
+    news = load_featured_food_news() or load_market_news(limit=9)
+    timestamp = datetime.now().strftime("Atualizado em %d/%m/%Y às %H:%M")
+    return render_news_content(news), timestamp
 
 
 @app.callback(Output("page", "children"), Input("url", "pathname"))
@@ -904,20 +1263,21 @@ def router(pathname):
             return page_intersections()
         if pathname == "/matriz":
             return page_matrix()
+        if pathname == "/clusters":
+            return page_clusters()
         if pathname == "/densidade":
             return page_density()
         if pathname == "/concorrencia":
             return page_competition()
+        if pathname == "/estatisticas":
+            return page_statistics()
+        if pathname == "/news":
+            return page_news()
+        if pathname == "/qualidade":
+            return page_data_quality()
         return page_dashboard()
     except Exception as e:
         return html.Div([html.H1("Erro"), html.Pre(str(e))], className="main")
-
-
-@app.callback(Output("chain-map", "figure"), Input("chain-map-mode", "value"), State("url", "pathname"), prevent_initial_call=True)
-def update_chain_map(mode, pathname):
-    cadeia = pathname.split("/cadeia/", 1)[1].replace("%20", " ") if pathname and "/cadeia/" in pathname else CHAINS[0]
-    df = DF[DF.cadeia == cadeia]
-    return map_fig(df, f"Mapa - {cadeia}", mode=mode or "Pontos")
 
 
 @app.callback(Output("inter-radius-input", "value"), Input("inter-radius", "value"))
@@ -928,6 +1288,7 @@ def sync_radius(v):
 @app.callback(
     Output("inter-kpis", "children"),
     Output("inter-map", "figure"),
+    Output("inter-heatmap", "figure"),
     Output("inter-table-wrap", "children"),
     Input("inter-pair", "value"),
     Input("inter-radius", "value"),
@@ -945,10 +1306,10 @@ def update_intersections(pair_value, radius):
             kpi_card("Lojas lado B", unique_b),
             kpi_card("Distância média", avg),
         ], className="g-3")
-        return kpis, inter_map(inter), intersection_table(inter)
+        return kpis, inter_map(inter), intersection_heatmap(inter), intersection_table(inter)
     except Exception as e:
         kpis = dbc.Alert(f"Erro no cálculo: {e}", color="danger")
-        return kpis, empty_fig("Erro ao calcular interseções"), html.Div(str(e), className="small-note")
+        return kpis, empty_fig("Erro ao calcular interseções"), empty_fig("Erro no heatmap"), html.Div(str(e), className="small-note")
 
 
 @app.callback(Output("matrix-table", "children"), Input("matrix-radius", "value"))
@@ -981,11 +1342,6 @@ def update_matrix(radius):
     except Exception as e:
         return dbc.Alert(str(e), color="danger")
 
-
-
-@app.callback(Output("comp-radius-input", "value"), Input("comp-radius", "value"))
-def sync_comp_radius(v):
-    return v
 
 
 @app.callback(
@@ -1105,8 +1461,31 @@ def update_statistics(chain_filter):
                 showlegend=False
             )
         else:
-            # Mostrar apenas uma cadeia - não tem sentido gráfico
-            fig_bar_chain = empty_fig("Selecione 'Todas' para ver o comparativo entre cadeias")
+            # Para uma cadeia, mostrar a qualidade/completude dos campos principais.
+            fields = {
+                "Morada": "morada",
+                "Município": "municipio",
+                "Distrito": "distrito",
+                "Telefone": "telefone",
+                "Email": "email",
+            }
+            coverage = []
+            for label, column in fields.items():
+                values = df[column].fillna("").astype(str).str.strip()
+                coverage.append({"campo": label, "percentagem": round((values != "").mean() * 100, 1) if len(df) else 0})
+            coverage_df = pd.DataFrame(coverage)
+            fig_bar_chain = px.bar(
+                coverage_df,
+                x="campo",
+                y="percentagem",
+                text="percentagem",
+                range_y=[0, 100],
+                title=f"Completude dos dados — {chain_filter}",
+                labels={"campo": "Campo", "percentagem": "Registos preenchidos (%)"},
+                height=400,
+            )
+            fig_bar_chain.update_traces(texttemplate="%{text:.1f}%", textposition="outside", marker_color=CHAIN_COLORS.get(chain_filter, "#2563eb"))
+            fig_bar_chain.update_layout(showlegend=False)
 
         # Gráfico de barras - Quantidade por município
         muni_counts = df.groupby("municipio").size().sort_values(ascending=False).head(15)
@@ -1148,7 +1527,16 @@ def update_statistics(chain_filter):
                 showlegend=True
             )
         else:
-            fig_pie_chain = empty_fig("Selecione 'Todas' para ver a distribuição por cadeias")
+            muni_values = df["municipio"].fillna("").astype(str).str.strip().replace("", "Município desconhecido")
+            muni_pie = muni_values.value_counts()
+            if len(muni_pie) > 10:
+                muni_pie = pd.concat([muni_pie.head(10), pd.Series({"Outros": int(muni_pie.iloc[10:].sum())})])
+            fig_pie_chain = go.Figure([go.Pie(labels=muni_pie.index, values=muni_pie.values, hole=0.4)])
+            fig_pie_chain.update_layout(
+                title=f"Distribuição territorial — {chain_filter}",
+                height=400,
+                showlegend=True,
+            )
 
         # Tabela - Comparativo por cadeia (se filtro for 'Todas')
         if chain_filter == "Todas":
@@ -1186,11 +1574,17 @@ def update_statistics(chain_filter):
             ])
         else:
             table = html.Div([
-                html.H5("Detalhes da cadeia:", className="mt-3 mb-2"),
+                html.H5(f"Amostra de lojas — {chain_filter}", className="mb-2"),
                 dash_table.DataTable(
-                    data=df.to_dict('records'),
-                    columns=[{"name": c, "id": c} for c in df.columns],
-                    page_size=50,
+                    data=df[["nome", "municipio", "distrito", "morada", "telefone"]].to_dict('records'),
+                    columns=[
+                        {"name": "Loja", "id": "nome"},
+                        {"name": "Município", "id": "municipio"},
+                        {"name": "Distrito", "id": "distrito"},
+                        {"name": "Morada", "id": "morada"},
+                        {"name": "Telefone", "id": "telefone"},
+                    ],
+                    page_size=12,
                     style_table={"overflowX": "auto"},
                     style_header={
                         "backgroundColor": "rgb(230, 230, 230)",
